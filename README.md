@@ -18,9 +18,10 @@ cp .env.example .env
 - `TELEGRAM_WEBHOOK_PATH` — путь webhook (по умолчанию `/telegram/webhook`).
 - `BACKEND_BASE_URL` — адрес `website_backend` внутри сети docker.
 - `TELEGRAM_WHITELIST` — список Telegram user id через запятую.
-- `TELEGRAM_SERVICE_INTERNAL_TOKEN` — токен для внутреннего эндпоинта `/internal/notify_user`.
-- `VACCANCY_COLLECTOR_BASE_URL` — базовый url `vacancy_collector`.
-- `VACCANCY_COLLECTOR_INGEST_PATH` — путь ingest (по умолчанию `/api/v1/vacancies/ingest`).
+- `TELEGRAM_SERVICE_INTERNAL_TOKEN` — токен для внутреннего эндпоинта `/internal/notify`.
+- `REDIS_URL` — адрес Redis для очереди и дедупликации.
+- `NOTIFY_QUEUE` — очередь уведомлений (по умолчанию `queue:notifications`).
+- `MANAGER_CHAT_IDS` — список chat_id менеджеров или групп через запятую (для уведомлений о мэтчах).
 - `PORT` — порт сервиса.
 
 3) Запустите:
@@ -34,4 +35,4 @@ Webhook регистрируется автоматически на старт�
 ## Как заполнять секреты
 - `TELEGRAM_BOT_TOKEN` — возьмите у @BotFather.
 - `TELEGRAM_BOT_SECRET` — сгенерируйте длинный случайный секрет (используется в `X-BOT-SECRET`).
-- `TELEGRAM_SERVICE_INTERNAL_TOKEN` — внутренний токен для коллбеков от collector (используется с публичным URL webhook).
+- `TELEGRAM_SERVICE_INTERNAL_TOKEN` — внутренний токен для `/internal/notify`.

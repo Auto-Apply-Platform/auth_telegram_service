@@ -9,8 +9,9 @@ class Settings(BaseSettings):
     backend_base_url: str = "http://website_backend:5000"
     telegram_whitelist: str = ""
     telegram_service_internal_token: str
-    vaccancy_collector_base_url: str
-    vaccancy_collector_ingest_path: str = "/api/v1/vacancies/ingest"
+    redis_url: str = "redis://redis:6379/0"
+    notify_queue: str = "queue:notifications"
+    manager_chat_ids: str = ""
     port: int = 8080
 
     model_config = SettingsConfigDict(
@@ -41,6 +42,21 @@ class Settings(BaseSettings):
                 continue
             try:
                 result.add(int(item))
+            except ValueError:
+                continue
+        return result
+
+    @property
+    def manager_chat_ids_list(self) -> list[int]:
+        if not self.manager_chat_ids:
+            return []
+        result: list[int] = []
+        for item in self.manager_chat_ids.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                result.append(int(item))
             except ValueError:
                 continue
         return result

@@ -1,19 +1,30 @@
 from contextlib import asynccontextmanager
+import contextlib
 import asyncio
+from datetime import datetime, timezone
+import json
 import logging
+import uuid
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.filters.command import CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
 from fastapi import FastAPI, Header, HTTPException, Request
 import httpx
 from pydantic import BaseModel
+from redis.asyncio import Redis
 
 from app.config import settings
 
 router = Router()
 logger = logging.getLogger(__name__)
+redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+
+QUEUE_NAME = "queue:vacancy_ingest"
+DEDUP_TTL_SECONDS = 60 * 60 * 24 * 7
+NOTIFY_QUEUE = settings.notify_queue
 
 
 def _build_confirm_keyboard(login_token: str) -> InlineKeyboardMarkup:
@@ -63,12 +74,18 @@ async def _confirm_login(login_token: str, user: User | None) -> str:
 @router.message(CommandStart())
 async def handle_start(message: Message, command: CommandObject) -> None:
     if not command.args:
-        await message.answer("Отсканируйте QR-код для входа.")
+        try:
+            await message.answer("Отсканируйте QR-код для входа.")
+        except TelegramBadRequest as exc:
+            logger.warning("telegram_answer_error chat_id=%s error=%s", message.chat.id, exc)
         return
-    await message.answer(
-        "Нажмите кнопку, чтобы подтвердить вход.",
-        reply_markup=_build_confirm_keyboard(command.args),
-    )
+    try:
+        await message.answer(
+            "Нажмите кнопку, чтобы подтвердить вход.",
+            reply_markup=_build_confirm_keyboard(command.args),
+        )
+    except TelegramBadRequest as exc:
+        logger.warning("telegram_answer_error chat_id=%s error=%s", message.chat.id, exc)
 
 
 @router.callback_query(F.data.startswith("confirm:"))
@@ -77,7 +94,10 @@ async def handle_confirm(callback: CallbackQuery) -> None:
     reply = await _confirm_login(login_token, callback.from_user)
     await callback.answer()
     if callback.message:
-        await callback.message.answer(reply)
+        try:
+            await callback.message.answer(reply)
+        except TelegramBadRequest as exc:
+            logger.warning("telegram_answer_error chat_id=%s error=%s", callback.message.chat.id, exc)
 
 
 def _shorten_text(text: str, limit: int = 80) -> str:
@@ -96,7 +116,7 @@ def _extract_message_text(message: Message) -> str | None:
     return None
 
 
-async def _send_to_collector(
+async def _enqueue_task(
     *,
     text: str,
     chat_id: int,
@@ -104,72 +124,70 @@ async def _send_to_collector(
     user_id: int,
     username: str | None,
 ) -> None:
-    url_base = settings.vaccancy_collector_base_url.rstrip("/")
-    path = settings.vaccancy_collector_ingest_path
-    if not path.startswith("/"):
-        path = f"/{path}"
-    url = f"{url_base}{path}"
-    payload = {
-        "raw_text": text,
+    task_id = str(uuid.uuid4())
+    dedup_key = f"dedup:bot:{chat_id}:{message_id}"
+    is_new = await redis_client.set(dedup_key, task_id, ex=DEDUP_TTL_SECONDS, nx=True)
+    if not is_new:
+        logger.info(
+            "bot_duplicate user_id=%s chat_id=%s message_id=%s",
+            user_id,
+            chat_id,
+            message_id,
+        )
+        return
+
+    task = {
+        "task_id": task_id,
         "source": "telegram_bot",
+        "raw_text": text,
         "telegram": {
             "chat_id": chat_id,
             "message_id": message_id,
             "user_id": user_id,
             "username": username,
         },
-        "callback": {
-            "notify_base_url": settings.public_base_url,
-            "notify_token": settings.telegram_service_internal_token,
-        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    headers: dict[str, str] = {}
-    timeout = httpx.Timeout(10.0)
-    retries = [0.5, 1.5]
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(len(retries) + 1):
+    try:
+        await redis_client.rpush(QUEUE_NAME, json.dumps(task))
+    except Exception as exc:
+        logger.warning(
+            "queue_error user_id=%s chat_id=%s message_id=%s error=%s",
+            user_id,
+            chat_id,
+            message_id,
+            exc,
+        )
+        return
+    logger.info(
+        "queued_vacancy user_id=%s chat_id=%s message_id=%s",
+        user_id,
+        chat_id,
+        message_id,
+    )
+
+
+async def _notification_loop() -> None:
+    manager_ids = settings.manager_chat_ids_list
+    while True:
+        item = await redis_client.blpop([NOTIFY_QUEUE], timeout=5)
+        if not item:
+            continue
+        _, raw = item
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        text = payload.get("text")
+        if not text:
+            continue
+        if not manager_ids:
+            continue
+        for chat_id in manager_ids:
             try:
-                response = await client.post(url, json=payload, headers=headers)
-            except httpx.RequestError as exc:
-                logger.warning(
-                    "collector_request_error user_id=%s chat_id=%s message_id=%s error=%s",
-                    user_id,
-                    chat_id,
-                    message_id,
-                    exc,
-                )
-                if attempt < len(retries):
-                    await asyncio.sleep(retries[attempt])
-                    continue
-                return
-            if response.status_code >= 500:
-                logger.warning(
-                    "collector_5xx user_id=%s chat_id=%s message_id=%s status=%s",
-                    user_id,
-                    chat_id,
-                    message_id,
-                    response.status_code,
-                )
-                if attempt < len(retries):
-                    await asyncio.sleep(retries[attempt])
-                    continue
-                return
-            if response.status_code >= 400:
-                logger.warning(
-                    "collector_4xx user_id=%s chat_id=%s message_id=%s status=%s",
-                    user_id,
-                    chat_id,
-                    message_id,
-                    response.status_code,
-                )
-                return
-            logger.info(
-                "collector_sent user_id=%s chat_id=%s message_id=%s",
-                user_id,
-                chat_id,
-                message_id,
-            )
-            return
+                await bot.send_message(chat_id, text)
+            except Exception as exc:
+                logger.warning("notify_manager_error chat_id=%s error=%s", chat_id, exc)
 
 
 @router.message()
@@ -186,7 +204,10 @@ async def handle_incoming_message(message: Message) -> None:
             chat_id,
             message_id,
         )
-        await message.answer("Доступ запрещён.")
+        try:
+            await message.answer("Доступ запрещён.")
+        except TelegramBadRequest as exc:
+            logger.warning("telegram_answer_error chat_id=%s error=%s", chat_id, exc)
         return
     text = _extract_message_text(message)
     if not text:
@@ -196,9 +217,15 @@ async def handle_incoming_message(message: Message) -> None:
             chat_id,
             message_id,
         )
-        await message.answer("Не вижу текста. Пришлите текстом.")
+        try:
+            await message.answer("Не вижу текста. Пришлите текстом.")
+        except TelegramBadRequest as exc:
+            logger.warning("telegram_answer_error chat_id=%s error=%s", chat_id, exc)
         return
-    await message.answer("Заявка принята!")
+    try:
+        await message.answer("Заявка принята!")
+    except TelegramBadRequest as exc:
+        logger.warning("telegram_answer_error chat_id=%s error=%s", chat_id, exc)
     logger.info(
         "telegram_received user_id=%s chat_id=%s message_id=%s text_preview=%s",
         user_id,
@@ -207,7 +234,7 @@ async def handle_incoming_message(message: Message) -> None:
         _shorten_text(text),
     )
     asyncio.create_task(
-        _send_to_collector(
+        _enqueue_task(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
@@ -224,11 +251,16 @@ dp.include_router(router)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    notify_task = asyncio.create_task(_notification_loop())
     if settings.telegram_webhook_public_url:
         await bot.set_webhook(settings.webhook_url)
     try:
         yield
     finally:
+        notify_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await notify_task
+        await redis_client.close()
         await bot.session.close()
 
 
@@ -247,7 +279,7 @@ class NotifyPayload(BaseModel):
     text: str
 
 
-@app.post("/internal/notify_user")
+@app.post("/internal/notify")
 async def notify_user(
     payload: NotifyPayload,
     x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
