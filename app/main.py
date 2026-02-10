@@ -169,8 +169,14 @@ async def _enqueue_task(
 
 async def _notification_loop() -> None:
     manager_ids = settings.manager_chat_ids_list
+    logger.info("notification_loop_start queue=%s managers=%s", NOTIFY_QUEUE, manager_ids)
     while True:
-        item = await redis_client.blpop([NOTIFY_QUEUE], timeout=5)
+        try:
+            item = await redis_client.blpop([NOTIFY_QUEUE], timeout=5)
+        except Exception as exc:
+            logger.exception("notification_loop_error error=%s", exc)
+            await asyncio.sleep(1)
+            continue
         if not item:
             continue
         _, raw = item
@@ -182,10 +188,11 @@ async def _notification_loop() -> None:
         if not text:
             continue
         if not manager_ids:
+            logger.info("notification_skip_no_managers")
             continue
         for chat_id in manager_ids:
             try:
-                await bot.send_message(chat_id, text)
+                await bot.send_message(chat_id, text, parse_mode="HTML")
             except Exception as exc:
                 logger.warning("notify_manager_error chat_id=%s error=%s", chat_id, exc)
 
@@ -286,5 +293,5 @@ async def notify_user(
 ) -> dict[str, bool]:
     if not x_internal_token or x_internal_token != settings.telegram_service_internal_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    await bot.send_message(payload.chat_id, payload.text)
+    await bot.send_message(payload.chat_id, payload.text, parse_mode="HTML")
     return {"ok": True}
